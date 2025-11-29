@@ -1,15 +1,18 @@
-from os import environ
+import os
 import sys
 import re
+import json
 import warnings
 from copy import copy
+from typing import List, Dict
 
 from openai import OpenAI
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup, NavigableString, Tag
-
 from dotenv import load_dotenv
+
+# Загрузка переменных окружения
 load_dotenv()
 
 # Отключаем шумные ворнинги
@@ -21,94 +24,57 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ==========================================
 INPUT_FILE = "The_story_of_an_hour_short_story_Kate_Chopin.epub"
 OUTPUT_FILE = "The_story_of_an_hour_short_story_Kate_Chopin_RU.epub"
-POE_MODEL = "gemini-2.5-flash-lite"
 
-# Теги, которые мы считаем "контейнерами" текста (блочные)
-BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'caption', 'td', 'th', 'div']
-# Теги, которые мы будем превращать в маркеры <tN> (инлайновые)
+# Используем модель, которую ты указал. 
+# Flash-lite быстрая, но для литературного перевода лучше Sonnet или GPT-4o.
+# Если качество будет низким, попробуй сменить на "Claude-3.5-Sonnet".
+POE_MODEL = "gemini-2.5-flash-lite" 
+
+# Размер батча (количество текстовых блоков за 1 запрос)
+# Для маленькой книги можно ставить больше, но 15-20 - безопасный оптимум для контекста
+BATCH_SIZE = 20 
+
+# Теги, которые содержат текст. УБРАЛ 'div', чтобы не ломать верстку контейнеров.
+BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'caption', 'td', 'th']
+
+# Инлайн теги для маскировки
 INLINE_TAGS = ['a', 'b', 'strong', 'i', 'em', 'span', 'small', 'sub', 'sup', 'code']
 
 # ==========================================
-# КЛИЕНТ POE (OpenAI Compatible)
+# КЛИЕНТ POE
 # ==========================================
-# Согласно документации: https://creator.poe.com/docs/external-applications/openai-compatible-api
+api_key = os.environ.get("API_POE_KEY")
+if not api_key:
+    print("Ошибка: Не задана переменная окружения API_POE_KEY")
+    sys.exit(1)
+
 client = OpenAI(
-    api_key=environ.get("API_POE_KEY"),
+    api_key=api_key,
     base_url="https://api.poe.com/v1"
 )
-
-def translate_text_with_poe(text_segment):
-    """
-    Отправляет текст с маркерами <t0>...</t0> в Poe.
-    """
-    system_prompt = """
-    Ты профессиональный переводчик литературы. Твоя задача — перевести текст с английского на русский.
-    
-    ИНСТРУКЦИЯ ПО СТРУКТУРЕ:
-    1. Текст содержит технические маркеры вида <t0>текст</t0>, <t1>текст</t1>.
-    2. Эти маркеры обозначают форматирование (ссылки, жирный шрифт).
-    3. ТЫ ОБЯЗАН сохранить эти маркеры в переводе на соответствующих местах.
-    4. ТЫ ОБЯЗАН перевести текст ВНУТРИ маркеров.
-    
-    Пример:
-    Input: Click <t0>here</t0> to go.
-    Output: Нажми <t0>сюда</t0>, чтобы перейти.
-    
-    Не добавляй никаких вступлений, только переведенный текст.
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model=POE_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text_segment}
-            ],
-            temperature=0.3 # Низкая температура для точности сохранения тегов
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"\n[API Error] {e}")
-        return text_segment # Возвращаем оригинал в случае ошибки
 
 # ==========================================
 # ЛОГИКА "SKELETON" (МАРКЕРЫ)
 # ==========================================
 
 class TagRegistry:
-    """Хранилище для оригинальных тегов"""
+    """Хранилище для оригинальных тегов, чтобы восстановить их после перевода"""
     def __init__(self):
         self.registry = {}
         self.counter = 0
 
     def register(self, tag):
-        """Заменяет реальный тег на маркер и сохраняет оригинал"""
+        """Заменяет реальный тег на маркер <tN>"""
         key = f"t{self.counter}"
         self.counter += 1
-        self.registry[key] = copy(tag) # Сохраняем копию тега с атрибутами
+        self.registry[key] = copy(tag)
         return key
 
     def get_original(self, key):
         return self.registry.get(key)
 
-def process_block(block_tag):
-    """
-    Берет HTML блок (например <p>), превращает инлайн теги в <tN>,
-    переводит текст, восстанавливает теги.
-    """
-    # 1. Проверка: есть ли текст?
-    if not block_tag.get_text(strip=True):
-        return
-
-    registry = TagRegistry()
-    
-    # 2. Создаем "Скелет": заменяем инлайн теги на <tN>
-    # Мы работаем с копией, чтобы не ломать итерацию, но модифицируем оригинал
-    # Для упрощения создадим временную строку-представление
-    
-    # Стратегия: Проходим по содержимому. Если это NavigableString - берем текст.
-    # Если Tag - регистрируем, берем его внутренний текст, оборачиваем в <tN>.
-    
+def skeletonize_block(block_tag, registry: TagRegistry) -> str:
+    """Превращает HTML блок в текст с маркерами <tN>"""
     skeleton_parts = []
     
     for child in block_tag.contents:
@@ -116,66 +82,126 @@ def process_block(block_tag):
             skeleton_parts.append(str(child))
         elif isinstance(child, Tag):
             if child.name in INLINE_TAGS:
-                # Рекурсивно получаем текст внутри тега (на случай вложенности, 
-                # хотя для простоты считаем 1 уровень достаточным для большинства книг)
-                inner_text = child.get_text() 
+                inner_text = child.get_text()
+                # Если внутри тега пусто или только пробелы, сохраняем как есть, не переводим
+                if not inner_text.strip():
+                     skeleton_parts.append(str(child))
+                     continue
+                
                 marker = registry.register(child)
                 skeleton_parts.append(f"<{marker}>{inner_text}</{marker}>")
             else:
-                # Если встретили что-то странное (например img), оставляем как есть (placeholder)
+                # Неизвестный тег (например br или img) просто оставляем текстом
                 skeleton_parts.append(str(child))
     
-    skeleton_text = "".join(skeleton_parts)
-    
-    # Если текст пустой или состоит только из пробелов
-    if not skeleton_text.strip():
-        return
+    return "".join(skeleton_parts)
 
-    # 3. Перевод через Poe
-    translated_text = translate_text_with_poe(skeleton_text)
+def restore_block(translated_text: str, original_block: Tag, registry: TagRegistry):
+    """Восстанавливает HTML из переведенного текста с маркерами"""
+    # Очищаем старый контент, но САМ ТЕГ (например <p class="center">) остается на месте
+    original_block.clear()
     
-    # 4. Восстановление (Re-hydration)
-    # Нам нужно распарсить переведенный текст, найти <tN> и заменить их обратно на реальные теги
-    
-    # Парсим полученный от LLM фрагмент как HTML
+    # Парсим фрагмент
     soup_fragment = BeautifulSoup(translated_text, 'html.parser')
     
     new_contents = []
-    
     for element in soup_fragment.contents:
         if isinstance(element, NavigableString):
             new_contents.append(element)
         elif isinstance(element, Tag):
-            # Проверяем, является ли это нашим маркером tN
             if re.match(r't\d+', element.name):
                 original_tag = registry.get_original(element.name)
                 if original_tag:
-                    # Клонируем оригинальный тег (чтобы сохранить href, class и т.д.)
                     restored_tag = copy(original_tag)
-                    # Вставляем внутрь переведенный текст
                     restored_tag.string = element.get_text()
                     new_contents.append(restored_tag)
                 else:
-                    # Если LLM выдумала несуществующий тег, просто возвращаем текст
+                    # Если LLM галлюцинировала тег
                     new_contents.append(NavigableString(element.get_text()))
             else:
-                # Какой-то другой тег, который LLM вернула (бывает редко)
                 new_contents.append(element)
-                
-    # 5. Обновляем исходный блок
-    block_tag.clear()
+    
     for item in new_contents:
-        block_tag.append(item)
+        original_block.append(item)
+
+# ==========================================
+# ЛОГИКА ПЕРЕВОДА (BATCHING)
+# ==========================================
+
+def translate_batch(texts: List[str]) -> List[str]:
+    """Отправляет список строк в Poe и получает список переводов"""
+    
+    # Твой промпт "Элитного Лингвиста" + Техническая инструкция JSON
+    system_prompt = """
+# ROLE & OBJECTIVE
+Ты — Элитный Лингвист и Переводчик-Перфекционист (уровень носителя русского языка с PhD в филологии). Твоя задача — перевести предоставленный список текстовых фрагментов на русский язык, достигнув показателя качества **минимум 98%**.
+
+# INPUT FORMAT
+Ты получишь JSON-список строк. Некоторые строки содержат технические маркеры вида <t0>...</t0>.
+Пример: ["Hello <t0>world</t0>", "Chapter 1"]
+
+# CRITICAL TECHNICAL RULES
+1. **FORMAT:** Твой ответ должен быть **СТРОГО валидным JSON-списком** строк. Никакого Markdown, никаких ```json``` оберток. Просто `["перевод 1", "перевод 2"]`.
+2. **TAGS:** Маркеры <tN>...</tN> (где N - число) — это святыня.
+   - Ты ОБЯЗАН сохранить их.
+   - Ты ОБЯЗАН перевести текст ВНУТРИ них.
+   - Ты НЕ ИМЕЕШЬ ПРАВА менять число N внутри тега.
+   - Пример: "Click <t5>here</t5>" -> "Нажми <t5>сюда</t5>".
+3. **LENGTH:** Количество элементов в выходном списке должно В ТОЧНОСТИ совпадать с входным.
+
+# TRANSLATION PROTOCOL (THE RECURSIVE LOOP)
+Используй свой внутренний итеративный процесс (до 8 циклов), чтобы довести перевод до идеала:
+1.  **Accuracy:** Нет ли искажений смысла?
+2.  **Style:** Звучит ли это как естественная русская речь? (Убраны ли кальки, канцеляризмы).
+3.  **Terminology:** Соблюдено ли единство?
+
+Выведи ТОЛЬКО финальный JSON-список.
+"""
+
+    user_content = json.dumps(texts, ensure_ascii=False)
+
+    try:
+        response = client.chat.completions.create(
+            model=POE_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.3
+        )
+        
+        content = response.choices[0].message.content.strip()
+        
+        # Очистка от markdown-блоков, если модель их добавила вопреки инструкции
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+            
+        translated_texts = json.loads(content)
+        
+        if len(translated_texts) != len(texts):
+            print(f"\n[Warning] Mismatch length! Sent {len(texts)}, got {len(translated_texts)}. Trying to align...")
+            # Если длины не совпадают, это авария. Возвращаем оригинал для безопасности.
+            return texts
+            
+        return translated_texts
+
+    except json.JSONDecodeError:
+        print(f"\n[Error] Model returned invalid JSON. Returning originals.")
+        print(f"Raw output start: {content[:100]}...")
+        return texts
+    except Exception as e:
+        print(f"\n[API Error] {e}")
+        return texts
 
 # ==========================================
 # ОСНОВНОЙ ЦИКЛ
 # ==========================================
 
 def main():
-    if not environ.get("API_POE_KEY"):
-        print("Ошибка: Не задана переменная окружения API_POE_KEY")
-        sys.exit(1)
-
     print(f"Загрузка книги: {INPUT_FILE}")
     try:
         book = epub.read_epub(INPUT_FILE)
@@ -183,42 +209,68 @@ def main():
         print("Файл не найден!")
         sys.exit(1)
 
-    total_items = 0
-    processed_items = 0
-
-    # Считаем документы для прогресса
     docs = [item for item in book.get_items() if item.get_type() == ebooklib.ITEM_DOCUMENT]
     total_docs = len(docs)
+    
+    print(f"Найдено глав: {total_docs}. Используем модель: {POE_MODEL}")
 
-    print(f"Найдено глав: {total_docs}. Начинаем перевод...")
-
-    for item in docs:
-        processed_items += 1
-        print(f"Processing chapter {processed_items}/{total_docs}: {item.get_name()}")
+    # Глобальный реестр тегов для всей книги (или можно создавать на главу, но лучше глобально для уникальности ID)
+    # Но для простоты сделаем реестр на каждый батч или главу. 
+    # Лучше на главу, чтобы не путаться.
+    
+    for doc_idx, item in enumerate(docs):
+        print(f"\nProcessing chapter {doc_idx + 1}/{total_docs}: {item.get_name()}")
         
         content = item.get_content()
         soup = BeautifulSoup(content, 'html.parser')
         
-        # Находим все блочные элементы
+        # Находим блоки. ВАЖНО: recursive=True по умолчанию в find_all, но нам нужно
+        # убедиться, что мы не берем вложенные блоки дважды.
+        # Стратегия: берем все P, H1..H6, LI. Они редко вложены друг в друга валидно.
         blocks = soup.find_all(BLOCK_TAGS)
         
-        # Проходим по блокам
-        for i, block in enumerate(blocks):
-            # Простейший вывод прогресса внутри главы
-            if i % 10 == 0:
-                sys.stdout.write(f"\r  Block {i}/{len(blocks)}")
-                sys.stdout.flush()
-            
-            process_block(block)
-            
-        print("") # Newline
+        # Фильтруем пустые блоки
+        valid_blocks = [b for b in blocks if b.get_text(strip=True)]
         
-        # Сохраняем измененный контент обратно в книгу
+        if not valid_blocks:
+            continue
+
+        # Подготовка батчей
+        current_batch_texts = []
+        current_batch_blocks = [] # Ссылки на объекты BeautifulSoup
+        current_registry = TagRegistry() # Реестр для текущей главы
+        
+        print(f"  Found {len(valid_blocks)} text blocks. Batching...")
+
+        for i, block in enumerate(valid_blocks):
+            # Скелетируем текст (заменяем <a> на <t0>)
+            text_skeleton = skeletonize_block(block, current_registry)
+            
+            current_batch_texts.append(text_skeleton)
+            current_batch_blocks.append(block)
+            
+            # Если батч заполнен или это последний блок
+            if len(current_batch_texts) >= BATCH_SIZE or i == len(valid_blocks) - 1:
+                # Отправляем в Poe
+                sys.stdout.write(f"\r  Translating batch {i // BATCH_SIZE + 1}...")
+                sys.stdout.flush()
+                
+                translated_batch = translate_batch(current_batch_texts)
+                
+                # Применяем переводы обратно к блокам
+                for block_ref, trans_text in zip(current_batch_blocks, translated_batch):
+                    restore_block(trans_text, block_ref, current_registry)
+                
+                # Очищаем батч
+                current_batch_texts = []
+                current_batch_blocks = []
+
+        # Сохраняем главу
         item.set_content(soup.encode(formatter="html"))
 
-    print(f"Сохранение результата в {OUTPUT_FILE}...")
+    print(f"\nСохранение результата в {OUTPUT_FILE}...")
     epub.write_epub(OUTPUT_FILE, book, {})
-    print("Готово!")
+    print("Готово! Проверь структуру и качество.")
 
 if __name__ == "__main__":
     main()
