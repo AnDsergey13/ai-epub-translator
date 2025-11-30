@@ -8,8 +8,7 @@ from typing import List
 from openai import OpenAI
 import ebooklib
 from ebooklib import epub
-from bs4 import BeautifulSoup, NavigableString
-# Исправление ошибки KeyError: 'xml' - импортируем класс явно
+from bs4 import BeautifulSoup
 from bs4.formatter import XMLFormatter
 from dotenv import load_dotenv
 
@@ -33,9 +32,8 @@ CHECKPOINT_FILE = "checkpoint.json"
 # Модель (используем flash для скорости, так как запросов будет много)
 POE_MODEL = "gemini-2.5-flash-lite"
 
-# Размер батча (количество текстовых фрагментов за раз)
-# Для этого метода лучше брать побольше, так как фрагменты могут быть короткими
-BATCH_SIZE = 30
+# Уменьшили размер батча для стабильности
+BATCH_SIZE = 15
 
 # Теги, содержимое которых НЕЛЬЗЯ переводить
 BLACKLIST_TAGS = {
@@ -96,52 +94,62 @@ SYSTEM_PROMPT = """
 """
 
 # ==========================================
-# ФУНКЦИЯ ПЕРЕВОДА
+# ФУНКЦИЯ ПЕРЕВОДА (С РЕКУРСИВНЫМ РАЗБИЕНИЕМ)
 # ==========================================
-def translate_batch(texts: List[str]) -> List[str]:
-    """Отправляет список строк на перевод и возвращает список переводов"""
-    if not texts:
-        return []
-    
-    # Очистка от пустых запросов, чтобы не тратить токены (хотя мы фильтруем их ранее)
+def _call_api(texts: List[str]) -> List[str]:
+    """Базовый вызов API"""
     json_payload = json.dumps(texts, ensure_ascii=False)
     
-    retries = 3
-    for attempt in range(retries):
-        try:
-            response = client.chat.completions.create(
-                model=POE_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": json_payload}
-                ],
-                temperature=0.3
-            )
-            content = response.choices[0].message.content.strip()
-            
-            # Очистка от markdown форматирования, если модель его добавила
-            if content.startswith("```json"): content = content[7:]
-            if content.startswith("```"): content = content[3:]
-            if content.endswith("```"): content = content[:-3]
-            
-            translated = json.loads(content)
-            
-            if len(translated) != len(texts):
-                print(f"  [Warn] Mismatch length: sent {len(texts)}, got {len(translated)}. Retrying...")
-                continue
-                
-            return translated
-            
-        except Exception as e:
-            print(f"  [Error] Attempt {attempt+1}/{retries}: {e}")
-            time.sleep(2)
+    response = client.chat.completions.create(
+        model=POE_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json_payload}
+        ],
+        temperature=0.3
+    )
+    content = response.choices[0].message.content.strip()
     
-    # Если все попытки провалились, возвращаем оригинал
-    print("  [Fail] Batch translation failed. Returning originals.")
-    return texts
+    if content.startswith("```json"): content = content[7:]
+    if content.startswith("```"): content = content[3:]
+    if content.endswith("```"): content = content[:-3]
+    
+    return json.loads(content)
+
+def translate_batch_robust(texts: List[str]) -> List[str]:
+    """
+    Умная функция перевода.
+    Если длина ответа не совпадает, разбивает батч на части и пробует снова.
+    """
+    if not texts:
+        return []
+
+    # Попытка перевести весь кусок
+    try:
+        translated = _call_api(texts)
+        if len(translated) == len(texts):
+            return translated
+        else:
+            print(f"    [Warn] Mismatch: sent {len(texts)}, got {len(translated)}. Splitting...")
+    except Exception as e:
+        print(f"    [Error] API Error: {e}. Splitting...")
+
+    # Если мы здесь, значит произошла ошибка или несовпадение длины.
+    # Если остался всего 1 элемент и он не перевелся — возвращаем оригинал (чтобы не зациклиться)
+    if len(texts) <= 1:
+        print(f"    [Fail] Skipping problematic line: {texts[0][:20]}...")
+        return texts
+
+    # Разбиваем батч пополам (Divide and Conquer)
+    mid = len(texts) // 2
+    left_part = texts[:mid]
+    right_part = texts[mid:]
+
+    # Рекурсивно переводим половинки
+    return translate_batch_robust(left_part) + translate_batch_robust(right_part)
 
 # ==========================================
-# ФУНКЦИИ СОХРАНЕНИЯ СОСТОЯНИЯ (CHECKPOINTS)
+# ФУНКЦИИ СОХРАНЕНИЯ
 # ==========================================
 def save_checkpoint(book, last_chapter_idx):
     """Сохраняет текущее состояние книги и индекс последней обработанной главы."""
@@ -184,87 +192,77 @@ def main():
     last_processed_idx = load_checkpoint_info()
     
     if last_processed_idx >= 0:
-        print(f"!!! НАЙДЕН ЧЕКПОИНТ !!!")
-        print(f"Возобновление перевода с временного файла: {TEMP_OUTPUT_FILE}")
-        print(f"Последняя успешно переведенная глава: {last_processed_idx + 1}")
-        print(f"Будут пропущены главы с 1 по {last_processed_idx + 1}")
-        
+        print(f"!!! ВОЗОБНОВЛЕНИЕ СЕССИИ !!!")
+        print(f"Загрузка из: {TEMP_OUTPUT_FILE}")
+        print(f"Пропуск глав: 1-{last_processed_idx + 1}")
         try:
             book = epub.read_epub(TEMP_OUTPUT_FILE)
-        except Exception as e:
-            print(f"Ошибка чтения чекпоинта: {e}. Начинаем заново с оригинала.")
+        except Exception:
+            print("Ошибка чекпоинта. Старт с нуля.")
             book = epub.read_epub(INPUT_FILE)
             last_processed_idx = -1
     else:
-        print(f"Загрузка оригинальной книги: {INPUT_FILE}")
-        try:
-            book = epub.read_epub(INPUT_FILE)
-        except Exception as e:
-            print(f"Ошибка открытия файла: {e}")
-            sys.exit(1)
+        print(f"Загрузка оригинала: {INPUT_FILE}")
+        book = epub.read_epub(INPUT_FILE)
 
     items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
     total_items = len(items)
     print(f"Всего документов в книге: {total_items}")
 
-    # 2. ОБРАБОТКА ГЛАВ
-    for idx, item in enumerate(items):
-        # Логика пропуска уже переведенных глав
-        if idx <= last_processed_idx:
-            print(f"--- Пропуск главы {idx + 1}/{total_items} (уже переведена) ---")
-            continue
+    try:
+        for idx, item in enumerate(items):
+            # Пропуск готовых глав
+            if idx <= last_processed_idx:
+                continue
 
-        print(f"\n--- Обработка главы {idx + 1}/{total_items}: {item.get_name()} ---")
-        
-        # Используем html.parser
-        content = item.get_content()
-        soup = BeautifulSoup(content, 'html.parser')
+            print(f"\n--- Глава {idx + 1}/{total_items}: {item.get_name()} ---")
+            
+            content = item.get_content()
+            soup = BeautifulSoup(content, 'html.parser')
 
-        # СБОР ТЕКСТОВЫХ УЗЛОВ
-        text_nodes = []
-        for node in soup.find_all(string=True):
-            if not node.strip(): continue
-            if isinstance(node, (BeautifulSoup, type(None))): continue
-            if node.parent and node.parent.name in BLACKLIST_TAGS: continue
-            text_nodes.append(node)
+            text_nodes = []
+            for node in soup.find_all(string=True):
+                if not node.strip(): continue
+                if isinstance(node, (BeautifulSoup, type(None))): continue
+                if node.parent and node.parent.name in BLACKLIST_TAGS: continue
+                text_nodes.append(node)
 
-        total_nodes = len(text_nodes)
-        print(f"  Найдено текстовых фрагментов: {total_nodes}")
-        
-        if total_nodes > 0:
-            # ПАКЕТНЫЙ ПЕРЕВОД
-            for i in range(0, total_nodes, BATCH_SIZE):
-                batch_nodes = text_nodes[i : i + BATCH_SIZE]
-                batch_texts = [node.string for node in batch_nodes]
-                
-                print(f"  Перевод батча {i//BATCH_SIZE + 1}/{(total_nodes//BATCH_SIZE) + 1} ({len(batch_texts)} строк)...", end="\r")
-                
-                translated_texts = translate_batch(batch_texts)
-                
-                for node, new_text in zip(batch_nodes, translated_texts):
-                    if new_text and new_text.strip():
-                        node.replace_with(new_text)
+            total_nodes = len(text_nodes)
+            print(f"  Фрагментов: {total_nodes}")
+            
+            if total_nodes > 0:
+                for i in range(0, total_nodes, BATCH_SIZE):
+                    batch_nodes = text_nodes[i : i + BATCH_SIZE]
+                    batch_texts = [node.string for node in batch_nodes]
+                    
+                    print(f"  Батч {i//BATCH_SIZE + 1}/{(total_nodes//BATCH_SIZE) + 1}...", end="\r")
+                    
+                    # Используем новую умную функцию
+                    translated_texts = translate_batch_robust(batch_texts)
+                    
+                    for node, new_text in zip(batch_nodes, translated_texts):
+                        if new_text and new_text.strip():
+                            node.replace_with(new_text)
 
-            print(f"\n  Глава обработана.")
+                # Сохраняем изменения в объект главы
+                formatter = XMLFormatter()
+                new_content = soup.encode('utf-8', formatter=formatter)
+                item.set_content(new_content)
+            
+            # Чекпоинт после главы
+            save_checkpoint(book, idx)
+            print(f"  [OK] Глава сохранена.")
 
-            # СОХРАНЕНИЕ В DOM
-            formatter = XMLFormatter()
-            new_content = soup.encode('utf-8', formatter=formatter)
-            item.set_content(new_content)
-        else:
-            print("  Глава пуста или не содержит переводимого текста.")
+    except KeyboardInterrupt:
+        print("\n\n!!! ПРИНУДИТЕЛЬНАЯ ОСТАНОВКА !!!")
+        print("Текущий прогресс сохранен в чекпоинте.")
+        print("Вы можете перезапустить скрипт позже, он продолжит работу.")
+        sys.exit(0)
 
-        # 3. СОХРАНЕНИЕ ЧЕКПОИНТА ПОСЛЕ КАЖДОЙ ГЛАВЫ
-        # Мы сохраняем ВСЮ книгу во временный файл, чтобы при рестарте загрузить её целиком
-        save_checkpoint(book, idx)
-
-    # 4. ФИНАЛЬНОЕ СОХРАНЕНИЕ
-    print(f"\nСохранение итогового файла: {OUTPUT_FILE}")
+    print(f"\nФинализация: {OUTPUT_FILE}")
     epub.write_epub(OUTPUT_FILE, book, {})
-    
-    # Удаляем временные файлы, так как все прошло успешно
     clean_checkpoints()
-    print("Готово! Временные файлы очищены, перевод завершен.")
+    print("Успешно завершено.")
 
 if __name__ == "__main__":
     main()
