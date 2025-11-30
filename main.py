@@ -26,6 +26,10 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 INPUT_FILE = "original_book.epub"
 OUTPUT_FILE = "translate_book_RU.epub"
 
+# Файлы для сохранения промежуточного прогресса
+TEMP_OUTPUT_FILE = "temp_progress_book.epub"
+CHECKPOINT_FILE = "checkpoint.json"
+
 # Модель (используем flash для скорости, так как запросов будет много)
 POE_MODEL = "gemini-2.5-flash-lite"
 
@@ -137,82 +141,130 @@ def translate_batch(texts: List[str]) -> List[str]:
     return texts
 
 # ==========================================
+# ФУНКЦИИ СОХРАНЕНИЯ СОСТОЯНИЯ (CHECKPOINTS)
+# ==========================================
+def save_checkpoint(book, last_chapter_idx):
+    """Сохраняет текущее состояние книги и индекс последней обработанной главы."""
+    try:
+        # 1. Сохраняем промежуточный EPUB
+        epub.write_epub(TEMP_OUTPUT_FILE, book, {})
+        
+        # 2. Сохраняем метаданные (индекс главы)
+        data = {"last_chapter_idx": last_chapter_idx}
+        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            
+        print(f"  [Checkpoint] Прогресс сохранен. Глава {last_chapter_idx} завершена.")
+    except Exception as e:
+        print(f"  [Error] Не удалось сохранить чекпоинт: {e}")
+
+def load_checkpoint_info():
+    """Читает файл чекпоинта и возвращает индекс последней главы или -1."""
+    if os.path.exists(CHECKPOINT_FILE) and os.path.exists(TEMP_OUTPUT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("last_chapter_idx", -1)
+        except Exception:
+            return -1
+    return -1
+
+def clean_checkpoints():
+    """Удаляет временные файлы после успешного завершения."""
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+    if os.path.exists(TEMP_OUTPUT_FILE):
+        os.remove(TEMP_OUTPUT_FILE)
+
+# ==========================================
 # MAIN
 # ==========================================
 def main():
-    print(f"Загрузка книги: {INPUT_FILE}")
-    try:
-        book = epub.read_epub(INPUT_FILE)
-    except Exception as e:
-        print(f"Ошибка открытия файла: {e}")
-        sys.exit(1)
+    # 1. ПРОВЕРКА НАЛИЧИЯ ЧЕКПОИНТА
+    last_processed_idx = load_checkpoint_info()
+    
+    if last_processed_idx >= 0:
+        print(f"!!! НАЙДЕН ЧЕКПОИНТ !!!")
+        print(f"Возобновление перевода с временного файла: {TEMP_OUTPUT_FILE}")
+        print(f"Последняя успешно переведенная глава: {last_processed_idx + 1}")
+        print(f"Будут пропущены главы с 1 по {last_processed_idx + 1}")
+        
+        try:
+            book = epub.read_epub(TEMP_OUTPUT_FILE)
+        except Exception as e:
+            print(f"Ошибка чтения чекпоинта: {e}. Начинаем заново с оригинала.")
+            book = epub.read_epub(INPUT_FILE)
+            last_processed_idx = -1
+    else:
+        print(f"Загрузка оригинальной книги: {INPUT_FILE}")
+        try:
+            book = epub.read_epub(INPUT_FILE)
+        except Exception as e:
+            print(f"Ошибка открытия файла: {e}")
+            sys.exit(1)
 
     items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
     total_items = len(items)
-    
-    print(f"Найдено документов: {total_items}")
+    print(f"Всего документов в книге: {total_items}")
 
+    # 2. ОБРАБОТКА ГЛАВ
     for idx, item in enumerate(items):
+        # Логика пропуска уже переведенных глав
+        if idx <= last_processed_idx:
+            print(f"--- Пропуск главы {idx + 1}/{total_items} (уже переведена) ---")
+            continue
+
         print(f"\n--- Обработка главы {idx + 1}/{total_items}: {item.get_name()} ---")
         
         # Используем html.parser
         content = item.get_content()
         soup = BeautifulSoup(content, 'html.parser')
 
-        # 1. СБОР ТЕКСТОВЫХ УЗЛОВ (TEXT NODES)
-        # Мы ищем все NavigableString, которые не являются пробелами и не внутри запрещенных тегов
+        # СБОР ТЕКСТОВЫХ УЗЛОВ
         text_nodes = []
-        
         for node in soup.find_all(string=True):
-            # Пропускаем, если это просто перенос строки или пробелы
-            if not node.strip():
-                continue
-            
-            # Пропускаем комментарии и спец. директивы
-            if isinstance(node, (BeautifulSoup, type(None))): 
-                continue
-                
-            # Проверяем родителей на наличие в черном списке (стили, скрипты)
-            if node.parent and node.parent.name in BLACKLIST_TAGS:
-                continue
-                
+            if not node.strip(): continue
+            if isinstance(node, (BeautifulSoup, type(None))): continue
+            if node.parent and node.parent.name in BLACKLIST_TAGS: continue
             text_nodes.append(node)
 
         total_nodes = len(text_nodes)
         print(f"  Найдено текстовых фрагментов: {total_nodes}")
         
-        if total_nodes == 0:
-            continue
+        if total_nodes > 0:
+            # ПАКЕТНЫЙ ПЕРЕВОД
+            for i in range(0, total_nodes, BATCH_SIZE):
+                batch_nodes = text_nodes[i : i + BATCH_SIZE]
+                batch_texts = [node.string for node in batch_nodes]
+                
+                print(f"  Перевод батча {i//BATCH_SIZE + 1}/{(total_nodes//BATCH_SIZE) + 1} ({len(batch_texts)} строк)...", end="\r")
+                
+                translated_texts = translate_batch(batch_texts)
+                
+                for node, new_text in zip(batch_nodes, translated_texts):
+                    if new_text and new_text.strip():
+                        node.replace_with(new_text)
 
-        # 2. ПАКЕТНЫЙ ПЕРЕВОД
-        # Разбиваем на батчи и переводим
-        for i in range(0, total_nodes, BATCH_SIZE):
-            batch_nodes = text_nodes[i : i + BATCH_SIZE]
-            batch_texts = [node.string for node in batch_nodes]
-            
-            print(f"  Перевод батча {i//BATCH_SIZE + 1}/{(total_nodes//BATCH_SIZE) + 1} ({len(batch_texts)} строк)...", end="\r")
-            
-            translated_texts = translate_batch(batch_texts)
-            
-            # 3. ЗАМЕНА ТЕКСТА В DOM
-            # Самая важная часть: мы меняем содержимое узла на месте
-            for node, new_text in zip(batch_nodes, translated_texts):
-                if new_text and new_text.strip():
-                    # replace_with заменяет узел в дереве
-                    node.replace_with(new_text)
+            print(f"\n  Глава обработана.")
 
-        print(f"\n  Глава обработана.")
+            # СОХРАНЕНИЕ В DOM
+            formatter = XMLFormatter()
+            new_content = soup.encode('utf-8', formatter=formatter)
+            item.set_content(new_content)
+        else:
+            print("  Глава пуста или не содержит переводимого текста.")
 
-        # 4. СОХРАНЕНИЕ
-        # Используем XMLFormatter явно, чтобы избежать KeyError: 'xml'
-        # Это гарантирует валидный XHTML для EPUB (закрытые теги <br/>, <link/> и т.д.)
-        formatter = XMLFormatter()
-        new_content = soup.encode('utf-8', formatter=formatter)
-        item.set_content(new_content)
+        # 3. СОХРАНЕНИЕ ЧЕКПОИНТА ПОСЛЕ КАЖДОЙ ГЛАВЫ
+        # Мы сохраняем ВСЮ книгу во временный файл, чтобы при рестарте загрузить её целиком
+        save_checkpoint(book, idx)
 
+    # 4. ФИНАЛЬНОЕ СОХРАНЕНИЕ
     print(f"\nСохранение итогового файла: {OUTPUT_FILE}")
     epub.write_epub(OUTPUT_FILE, book, {})
-    print("Готово! Структура полностью сохранена.")
+    
+    # Удаляем временные файлы, так как все прошло успешно
+    clean_checkpoints()
+    print("Готово! Временные файлы очищены, перевод завершен.")
 
 if __name__ == "__main__":
     main()
