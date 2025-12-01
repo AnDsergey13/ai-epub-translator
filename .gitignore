@@ -2,4 +2,4 @@ temp/
 __pycache__
 .env
 
-.epub
+*.epub
